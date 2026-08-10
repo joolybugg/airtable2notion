@@ -1,0 +1,25 @@
+# --- Secrets: never commit ---
+.env
+.env.*
+!.env.example
+
+# --- Migration output (contains your Notion IDs and structure) ---
+migration_state*.json
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+*.egg-info/
+.Python
+build/
+dist/
+
+# --- OS / editor ---
+.DS_Store
+.idea/
+.vscode/
+*.swp
