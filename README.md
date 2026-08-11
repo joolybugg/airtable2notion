@@ -22,7 +22,10 @@ The migration runs in two passes in a single command:
 2. **Relations.** For each Airtable linked-record field it adds a relation
    property to the source data source pointing at the target data source
    (resolved from the field's `linkedTableId` in the schema), then patches each
-   page to set the actual links.
+   page to set the actual links. Two-way Airtable links are detected via each
+   field's `inverseLinkFieldId` and created as a single synced Notion relation
+   (`dual_property`), so a bidirectional link becomes one two-way relation rather
+   than two disconnected one-way ones.
 
 Progress is checkpointed to `migration_state_<base_id>.json` as it runs, so an
 interrupted migration can be resumed rather than restarted.
@@ -39,14 +42,14 @@ container and the table of records is a "data source". Pages are created under a
 ## Setup
 
 1. **Create an Airtable personal access token** at
-   <https://airtable.com/create/tokens> with the scopes `schema.bases:read` and
+   [https://airtable.com/create/tokens](https://airtable.com/create/tokens) with the scopes `schema.bases:read` and
    `data.records:read`, and grant it access to the base you are migrating.
 2. **Find the base id.** It starts with `app` and appears in the base URL
    (`airtable.com/appXXXXXXXX/...`) or in the Airtable API docs for your base.
 3. **Create a Notion internal integration** at
-   <https://www.notion.so/my-integrations> and copy its secret.
+   [https://www.notion.so/my-integrations](https://www.notion.so/my-integrations) and copy its secret.
 4. **Connect the integration to a parent page.** Open the Notion page you want
-   the databases created under, then `•••` -> **Connections** -> select your
+   the databases created under, then `•••` -\> **Connections** -\> select your
    integration. This step is required: without it, the API returns
    `object_not_found` even with a correct page ID.
 
@@ -62,8 +65,8 @@ NOTION_PARENT_PAGE_ID=...
 ```
 
 With `python-dotenv` installed, the script loads `.env` automatically; otherwise
-export the same variables in your shell. **`.env` is gitignored — never commit
-real tokens.**
+export the same variables in your shell. \*\*`.env` is gitignored — never commit
+real tokens.\*\*
 
 ## Run
 

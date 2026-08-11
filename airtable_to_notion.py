@@ -18,7 +18,9 @@ Two-pass design (single run):
   Pass 2  For each Airtable linked-record field, add a relation property to the
           source data source pointing at the target data source (resolved from
           the field's linkedTableId in the schema), then patch each page to set
-          the actual links.
+          the actual links. Two-way Airtable links (paired via inverseLinkFieldId)
+          are created as a single synced Notion relation (dual_property) rather
+          than two independent one-way relations.
 
 Airtable makes both passes simpler than a Coda source would: the Metadata API
 returns the full typed schema (field types, select choices, and each linked
@@ -231,20 +233,24 @@ class NotionClient:
         return self._post("/pages", body)["id"]
 
     def add_relation_property(
-        self, data_source_id: str, prop_name: str, target_data_source_id: str
-    ) -> None:
-        body = {
-            "properties": {
-                prop_name: {
-                    "type": "relation",
-                    "relation": {
-                        "data_source_id": target_data_source_id,
-                        "single_property": {},
-                    },
-                }
-            }
-        }
-        self._patch(f"/data_sources/{data_source_id}", body)
+        self, data_source_id: str, prop_name: str, target_data_source_id: str,
+        *, dual: bool = False,
+    ) -> dict:
+        """Add a relation property. When dual=True, Notion also creates a synced
+        property on the target data source (a true two-way relation). Returns the
+        updated data source so the caller can read the synced property id."""
+        relation: dict[str, Any] = {"data_source_id": target_data_source_id}
+        if dual:
+            relation["dual_property"] = {}
+        else:
+            relation["single_property"] = {}
+        body = {"properties": {prop_name: {"type": "relation", "relation": relation}}}
+        return self._patch(f"/data_sources/{data_source_id}", body)
+
+    def rename_property(self, data_source_id: str, prop_id: str, new_name: str) -> None:
+        """Rename a property (used to give a synced dual property its Airtable name)."""
+        self._patch(f"/data_sources/{data_source_id}",
+                    {"properties": {prop_id: {"name": new_name}}})
 
     def set_page_relation(
         self, page_id: str, prop_name: str, target_page_ids: list[str]
@@ -335,7 +341,8 @@ class FieldPlan:
     notion_kind: str
     options: set[str] = field(default_factory=set)
     is_title: bool = False
-    link_target: str | None = None   # target table id for relation fields
+    link_target: str | None = None       # target table id for relation fields
+    inverse_field_id: str | None = None  # paired field on the target (two-way links)
 
 
 def resolve_kind(f: dict) -> str:
@@ -448,9 +455,13 @@ def build_field_plans(
             continue
 
         if ftype == LINK_TYPE:
-            target = (f.get("options") or {}).get("linkedTableId")
+            opts = f.get("options") or {}
             relation_plans.append(
-                FieldPlan(fid, ftype, name, "relation", link_target=target)
+                FieldPlan(
+                    fid, ftype, name, "relation",
+                    link_target=opts.get("linkedTableId"),
+                    inverse_field_id=opts.get("inverseLinkFieldId"),
+                )
             )
             continue
 
@@ -524,6 +535,12 @@ def load_state(path: str, base_id: str, parent_page: str) -> dict:
             state = json.load(fh)
         if state.get("base_id") == base_id:
             state.setdefault("tables", {})
+            # Backfill per-relation status for state written before dual-relation
+            # support, so a resumed run does not re-wire completed relations.
+            for rec in state["tables"].values():
+                default = "wired" if rec.get("relations_wired") else "pending"
+                for r in rec.get("relations", []):
+                    r.setdefault("status", default)
             done = sum(1 for r in state["tables"].values() if r.get("complete"))
             log.info("Resuming from %s: %d table(s) already complete", path, done)
             return state
@@ -616,7 +633,13 @@ def migrate(
                 "notion_data_source_id": ds_id,
                 "row_map": row_map,
                 "relations": [
-                    {"name": rp.name, "field_id": rp.field_id, "link_target": rp.link_target}
+                    {
+                        "name": rp.name,
+                        "field_id": rp.field_id,
+                        "link_target": rp.link_target,
+                        "inverse_field_id": rp.inverse_field_id,
+                        "status": "pending",
+                    }
                     for rp in relation_plans
                 ],
                 "complete": False,
@@ -652,12 +675,16 @@ def migrate(
     # -------- Pass 2: relations -------- #
     ds_by_table = {tid: rec["notion_data_source_id"] for tid, rec in tables_state.items()}
 
+    def find_relation(table_id: str | None, field_id: str | None) -> dict | None:
+        """Locate a relation entry by table + field id (its paired inverse side)."""
+        t = tables_state.get(table_id) if table_id else None
+        if not t or not field_id:
+            return None
+        return next((r for r in t["relations"] if r["field_id"] == field_id), None)
+
     for tid, rec in tables_state.items():
-        if not rec["relations"]:
-            rec["relations_wired"] = True
-            continue
-        if rec.get("relations_wired"):
-            log.info("Skipping relations for %r: already wired", rec["airtable_table_name"])
+        pending = [r for r in rec["relations"] if r.get("status", "pending") == "pending"]
+        if not pending:
             continue
 
         log.info("Wiring relations for table %r", rec["airtable_table_name"])
@@ -665,6 +692,8 @@ def migrate(
         rows_by_id = {r["id"]: r for r in records}
 
         for rel in rec["relations"]:
+            if rel.get("status", "pending") != "pending":
+                continue
             field_id, prop_name, target_tbl = rel["field_id"], rel["name"], rel["link_target"]
             target_ds = ds_by_table.get(target_tbl)
             if target_ds is None:
@@ -672,10 +701,36 @@ def migrate(
                     "  %r links to table %s which was not migrated; skipping",
                     prop_name, target_tbl,
                 )
+                rel["status"] = "skipped"
                 continue
 
-            notion.add_relation_property(rec["notion_data_source_id"], prop_name, target_ds)
+            # A two-way Airtable link names its paired field via inverseLinkFieldId.
+            # If that field is itself a migrated relation, create one synced
+            # (dual) Notion relation for the pair instead of two one-way ones.
+            inverse_rel = find_relation(target_tbl, rel.get("inverse_field_id"))
+            dual = inverse_rel is not None
 
+            resp = notion.add_relation_property(
+                rec["notion_data_source_id"], prop_name, target_ds, dual=dual
+            )
+
+            if dual:
+                # Rename Notion's auto-created synced property to the Airtable
+                # inverse field's name, when possible.
+                try:
+                    synced_id = (
+                        resp["properties"][prop_name]["relation"]["dual_property"]
+                        ["synced_property_id"]
+                    )
+                    notion.rename_property(target_ds, synced_id, inverse_rel["name"])
+                except (KeyError, RuntimeError) as exc:
+                    log.warning(
+                        "  could not rename synced property for %r (%s); keeping "
+                        "Notion's default name", prop_name, type(exc).__name__,
+                    )
+                inverse_rel["status"] = "synced_via_pair"
+
+            # Set links from this side; a dual relation mirrors them to the other.
             target_row_map = tables_state[target_tbl]["row_map"]
             wired = 0
             for rid, page_id in rec["row_map"].items():
@@ -687,10 +742,13 @@ def migrate(
                 if target_pages:
                     notion.set_page_relation(page_id, prop_name, target_pages)
                     wired += 1
-            log.info("  %r -> %s: linked %d rows", prop_name, target_tbl, wired)
 
-        rec["relations_wired"] = True
-        save_state(state_path, state)
+            rel["status"] = "wired"
+            log.info("  %r -> %s: linked %d rows (%s)", prop_name, target_tbl, wired,
+                     "synced pair" if dual else "one-way")
+            save_state(state_path, state)
+
+    save_state(state_path, state)
 
     save_state(state_path, state)
     log.info("Done. State saved to %s", state_path)
