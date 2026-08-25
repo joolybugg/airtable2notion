@@ -214,7 +214,7 @@ class NotionClient:
         """Create a database + initial data source. Returns (db_id, data_source_id)."""
         body = {
             "parent": {"type": "page_id", "page_id": parent_page_id},
-            "title": [{"type": "text", "text": {"content": title[:TEXT_LIMIT]}}],
+            "title": [{"type": "text", "text": {"content": clip_text(title)}}],
             "initial_data_source": {"properties": properties},
         }
         resp = self._post("/databases", body)
@@ -291,7 +291,26 @@ def to_text(value: Any) -> str:
 
 def sanitize_option(name: str) -> str:
     # Notion select/multi_select option names may not contain commas.
-    return name.replace(",", " ").strip()[:TEXT_LIMIT]
+    return clip_text(name.replace(",", " ").strip())
+
+
+def clip_text(text: str, limit: int = TEXT_LIMIT) -> str:
+    """Truncate to at most `limit` UTF-16 code units, which is how Notion counts
+    string length (JavaScript-style). A character outside the Basic Multilingual
+    Plane, such as an emoji, is one Python character but two UTF-16 units, so a
+    plain [:limit] slice can still exceed Notion's cap. This never splits a
+    surrogate pair."""
+    if len(text) <= limit and text.isascii():
+        return text
+    encoded = text.encode("utf-16-le")
+    if len(encoded) <= limit * 2:
+        return text
+    clipped = encoded[: limit * 2]
+    try:
+        return clipped.decode("utf-16-le")
+    except UnicodeDecodeError:
+        # The cut landed inside a surrogate pair; drop the dangling half.
+        return clipped[:-2].decode("utf-16-le")
 
 
 # --------------------------------------------------------------------------- #
@@ -387,10 +406,10 @@ def notion_property_value(plan: FieldPlan, raw: Any) -> dict | None:
     flat = flatten(raw)
 
     if kind == "title":
-        return {"title": [{"text": {"content": to_text(flat)[:TEXT_LIMIT]}}]}
+        return {"title": [{"text": {"content": clip_text(to_text(flat))}}]}
     if kind == "rich_text":
         text = to_text(flat)
-        return {"rich_text": [{"text": {"content": text[:TEXT_LIMIT]}}]} if text else None
+        return {"rich_text": [{"text": {"content": clip_text(text)}}]} if text else None
     if kind == "number":
         if isinstance(raw, (int, float)) and not isinstance(raw, bool):
             return {"number": float(raw)}
