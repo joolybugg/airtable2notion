@@ -268,6 +268,10 @@ def flatten(value: Any) -> Any:
     if isinstance(value, list):
         return [flatten(v) for v in value]
     if isinstance(value, dict):
+        # Airtable returns {"error": "#ERROR!"} for a field whose formula failed
+        # to compute. Treat it as empty rather than forwarding the object.
+        if "error" in value:
+            return None
         # Barcode -> text; collaborator -> name/email; attachment/button -> url.
         if "text" in value:
             return value["text"]
@@ -422,7 +426,9 @@ def notion_property_value(plan: FieldPlan, raw: Any) -> dict | None:
         return {"checkbox": bool(raw)}
     if kind == "date":
         s = to_text(flat).strip()
-        if not s:
+        # A valid ISO 8601 date always starts with a year digit. Anything else
+        # (a stray string, a leftover error marker) is dropped rather than sent.
+        if not s or not s[0].isdigit():
             return None
         return {"date": {"start": s.split(" - ")[0].strip()}}
     if kind == "select":
