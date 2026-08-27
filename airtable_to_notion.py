@@ -105,6 +105,27 @@ class Throttle:
         self._last = time.monotonic()
 
 
+class ApiError(RuntimeError):
+    """An HTTP error from an API call, carrying the status code so callers can
+    decide whether it is per-record (skip) or systemic (halt)."""
+
+    def __init__(self, method: str, url: str, status_code: int, body: str) -> None:
+        self.status_code = status_code
+        self.body = body
+        super().__init__(f"{method} {url} failed {status_code}: {body}")
+
+
+def short_error(body: str, limit: int = 300) -> str:
+    """Pull the human-readable message out of a Notion error body for logging."""
+    try:
+        msg = json.loads(body).get("message")
+        if msg:
+            return msg[:limit]
+    except (ValueError, TypeError):
+        pass
+    return body[:limit]
+
+
 def _request(
     session: requests.Session,
     method: str,
@@ -151,7 +172,7 @@ def _request(
             )
             time.sleep(delay)
             continue
-        raise RuntimeError(f"{method} {url} failed {resp.status_code}: {resp.text}")
+        raise ApiError(method, url, resp.status_code, resp.text)
     raise RuntimeError(f"{method} {url} exhausted retries")
 
 
@@ -362,7 +383,8 @@ class FieldPlan:
     airtable_type: str
     name: str
     notion_kind: str
-    options: set[str] = field(default_factory=set)
+    options: list[str] = field(default_factory=list)          # canonical, deduped, in order
+    option_lookup: dict[str, str] = field(default_factory=dict)  # casefold -> canonical
     is_title: bool = False
     link_target: str | None = None       # target table id for relation fields
     inverse_field_id: str | None = None  # paired field on the target (two-way links)
@@ -393,7 +415,7 @@ def notion_property_def(plan: FieldPlan) -> dict:
         fmt = {"currency": "dollar", "percent": "percent"}.get(plan.airtable_type, "number")
         return {"number": {"format": fmt}}
     if kind in ("select", "multi_select"):
-        opts = [{"name": o} for o in sorted(plan.options)][:MAX_SELECT_OPTIONS]
+        opts = [{"name": o} for o in plan.options[:MAX_SELECT_OPTIONS]]
         return {kind: {"options": opts}}
     if kind in ("email", "url", "phone_number", "checkbox", "date", "rich_text"):
         return {kind: {}}
@@ -433,11 +455,21 @@ def notion_property_value(plan: FieldPlan, raw: Any) -> dict | None:
         return {"date": {"start": s.split(" - ")[0].strip()}}
     if kind == "select":
         name = sanitize_option(to_text(flat))
-        return {"select": {"name": name}} if name else None
+        if not name:
+            return None
+        return {"select": {"name": plan.option_lookup.get(name.casefold(), name)}}
     if kind == "multi_select":
         values = flat if isinstance(flat, list) else [flat]
-        names = [sanitize_option(str(v)) for v in values if str(v).strip()]
-        names = [n for n in names if n]
+        names: list[str] = []
+        seen: set[str] = set()
+        for v in values:
+            nm = sanitize_option(str(v))
+            if not nm:
+                continue
+            canon = plan.option_lookup.get(nm.casefold(), nm)
+            if canon.casefold() not in seen:      # dedupe within the cell too
+                seen.add(canon.casefold())
+                names.append(canon)
         return {"multi_select": [{"name": n} for n in names]} if names else None
     if kind in ("email", "url", "phone_number"):
         text = to_text(flat).strip()
@@ -494,11 +526,15 @@ def build_field_plans(
         plan = FieldPlan(fid, ftype, name, kind)
 
         # Select options come straight from the schema (no data scan needed).
+        # Dedupe case-insensitively (Notion collapses names by case/whitespace),
+        # keeping the first spelling and a lookup so record values map to it.
         if kind in ("select", "multi_select"):
             for choice in ((f.get("options") or {}).get("choices") or []):
                 nm = sanitize_option(choice.get("name", ""))
-                if nm:
-                    plan.options.add(nm)
+                key = nm.casefold()
+                if nm and key not in plan.option_lookup:
+                    plan.option_lookup[key] = nm
+                    plan.options.append(nm)
 
         scalar_plans.append(plan)
 
@@ -669,11 +705,14 @@ def migrate(
                 ],
                 "complete": False,
                 "relations_wired": False,
+                "skipped": {},
             }
             tables_state[tid] = rec
             save_state(state_path, state)
 
+        skipped = rec.setdefault("skipped", {})
         inserted = 0
+        consecutive_fail = 0
         for record in records:
             rid = record["id"]
             if rid in row_map:
@@ -687,15 +726,43 @@ def migrate(
             title_plan = next((p for p in scalar_plans if p.is_title), None)
             if title_plan and title_plan.name not in props:
                 props[title_plan.name] = {"title": [{"text": {"content": ""}}]}
-            page_id = notion.create_page(ds_id, props)
+
+            try:
+                page_id = notion.create_page(ds_id, props)
+            except ApiError as exc:
+                # A 400 means Notion rejected THIS record's data. Skip it and go
+                # on, so one bad record does not halt the whole migration. Any
+                # other status (auth, missing parent, exhausted retries) is
+                # systemic, so re-raise and let resume recover.
+                if exc.status_code != 400:
+                    raise
+                consecutive_fail += 1
+                if consecutive_fail >= 10 and not row_map:
+                    log.error(
+                        "  %d records failed validation with no successes; this "
+                        "looks systemic rather than per-record. Halting so it can "
+                        "be diagnosed.", consecutive_fail,
+                    )
+                    raise
+                reason = short_error(exc.body)
+                log.warning("  skipping record %s: %s", rid, reason)
+                skipped[rid] = reason
+                save_state(state_path, state)
+                continue
+
+            consecutive_fail = 0
+            skipped.pop(rid, None)  # a previously-skipped record now succeeded
             row_map[rid] = page_id
             inserted += 1
             if inserted % SAVE_EVERY == 0:
                 save_state(state_path, state)
 
-        rec["complete"] = True
+        # Mark complete only when nothing was left unmigrated, so that fixing the
+        # source data and re-running retries just the skipped records.
+        rec["complete"] = not skipped
         save_state(state_path, state)
-        log.info("  inserted %d new page(s); %d rows total", inserted, len(row_map))
+        note = f"; {len(skipped)} skipped" if skipped else ""
+        log.info("  inserted %d new page(s); %d rows total%s", inserted, len(row_map), note)
 
     # -------- Pass 2: relations -------- #
     ds_by_table = {tid: rec["notion_data_source_id"] for tid, rec in tables_state.items()}
@@ -774,15 +841,25 @@ def migrate(
             save_state(state_path, state)
 
     save_state(state_path, state)
-
-    save_state(state_path, state)
     log.info("Done. State saved to %s", state_path)
     print("\nSummary")
     for rec in tables_state.values():
+        skipped_note = f", {len(rec.get('skipped', {}))} skipped" if rec.get("skipped") else ""
         print(
-            f"  {rec['airtable_table_name']}: {len(rec['row_map'])} rows, "
-            f"{len(rec['relations'])} relation field(s) -> database {rec['notion_database_id']}"
+            f"  {rec['airtable_table_name']}: {len(rec['row_map'])} rows"
+            f"{skipped_note}, {len(rec['relations'])} relation field(s) "
+            f"-> database {rec['notion_database_id']}"
         )
+
+    total_skipped = sum(len(rec.get("skipped", {})) for rec in tables_state.values())
+    if total_skipped:
+        print(f"\n{total_skipped} record(s) were skipped because Notion rejected "
+              f"their data:")
+        for rec in tables_state.values():
+            for rid, reason in rec.get("skipped", {}).items():
+                print(f"  [{rec['airtable_table_name']}] {rid}: {reason}")
+        print("\nFix these records in Airtable, then re-run with --restart to "
+              "retry the affected tables from scratch.")
 
 
 def main() -> None:
